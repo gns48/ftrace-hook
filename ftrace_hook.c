@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/kprobes.h>
+#include <linux/namei.h>
 
 MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
 MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com>");
@@ -237,103 +238,167 @@ void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
 #pragma GCC optimize("-fno-optimize-sibling-calls")
 #endif
 
-#ifdef PTREGS_SYSCALL_STUBS
-static asmlinkage long (*real_sys_clone)(struct pt_regs *regs);
-
-static asmlinkage long fh_sys_clone(struct pt_regs *regs)
+static char *get_absolute_path(int dfd, int lookup_flags,
+                               const char __user *user_filename,
+                               char *buffer, int buffer_length, int *error)
 {
+    struct path path;
+    char *ret_ptr = NULL;
+    int rv;
+
+    *error = 0;
+    rv = user_path_at(dfd, user_filename, lookup_flags, &path);
+    if (rv)
+        *error = rv;
+    else
+        ret_ptr = d_path(&path, buffer, buffer_length);
+    return ret_ptr;
+}
+
+int check_filename(int dfd, const char __user *filename) {
+    int lookup_flags =
+        LOOKUP_FOLLOW | LOOKUP_EMPTY |
+        LOOKUP_DOWN | LOOKUP_MOUNTPOINT;
+    char *lookup_buffer;
+    char *abspath;
+    int rv = 0;
+
+    lookup_buffer = kmalloc(PATH_MAX, GFP_KERNEL);
+    if(!lookup_buffer) return -ENOMEM;
+
+    abspath = get_absolute_path(dfd, lookup_flags, filename,
+                                lookup_buffer, PATH_MAX, &rv);
+    if(abspath) {
+        pr_info("%s: abspath: %s\n", __func__, abspath);
+    }
+
+    kfree(lookup_buffer);
+    return rv;
+}
+
+#ifdef PTREGS_SYSCALL_STUBS
+
+static asmlinkage long (*real_sys_clone)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_execve)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_execveat)(struct pt_regs *regs);
+
+static asmlinkage long fh_sys_clone(struct pt_regs *regs) {
 	long ret;
 
 	pr_info("clone() before\n");
-
 	ret = real_sys_clone(regs);
-
 	pr_info("clone() after: %ld\n", ret);
-
 	return ret;
 }
+
+static asmlinkage long fh_sys_execve(struct pt_regs *regs) {
+    long ret;
+
+    check_filename(AT_FDCWD, (void*)regs->di);
+
+    ret = real_sys_execve(regs);
+    pr_info("execve() after: %ld\n", ret);
+
+    return ret;
+}
+
+/*
+  %rax __NR_execveat
+  %rdi int dfd
+  %rsi const char __user *filename
+  %rdx const char __user *const __user *argv
+  %r10 const char __user *const __user *envp
+  %r8  int flags
+*/
+static asmlinkage long fh_sys_execveat(struct pt_regs *regs) {
+    long ret;
+
+    check_filename((int)regs->di, (void*)regs->si);
+
+    ret = real_sys_execveat(regs);
+    pr_info("execveat() after: %ld\n", ret);
+
+    return ret;
+}
+
+
 #else
+
 static asmlinkage long (*real_sys_clone)(unsigned long clone_flags,
-		unsigned long newsp, int __user *parent_tidptr,
-		int __user *child_tidptr, unsigned long tls);
+                                         unsigned long newsp,
+                                         int __user *parent_tidptr,
+                                         int __user *child_tidptr,
+                                         unsigned long tls);
+
+static asmlinkage long (*real_sys_execve)(
+    const char __user *filename,
+    const char __user *const __user *argv,
+    const char __user *const __user *envp);
+
+
+static asmlinkage long (*real_sys_execveat)(
+    int fd,
+    const char __user *filename,
+    const char __user *const __user *argv,
+    const char __user *const __user *envp,
+    int flags);
 
 static asmlinkage long fh_sys_clone(unsigned long clone_flags,
-		unsigned long newsp, int __user *parent_tidptr,
-		int __user *child_tidptr, unsigned long tls)
+                                    unsigned long newsp,
+                                    int __user *parent_tidptr,
+                                    int __user *child_tidptr,
+                                    unsigned long tls)
 {
 	long ret;
 
 	pr_info("clone() before\n");
 
 	ret = real_sys_clone(clone_flags, newsp, parent_tidptr,
-		child_tidptr, tls);
+                         child_tidptr, tls);
 
 	pr_info("clone() after: %ld\n", ret);
 
 	return ret;
 }
-#endif
-
-static char *duplicate_filename(const char __user *filename)
-{
-	char *kernel_filename;
-
-	kernel_filename = kmalloc(4096, GFP_KERNEL);
-	if (!kernel_filename)
-		return NULL;
-
-	if (strncpy_from_user(kernel_filename, filename, 4096) < 0) {
-		kfree(kernel_filename);
-		return NULL;
-	}
-
-	return kernel_filename;
-}
-
-#ifdef PTREGS_SYSCALL_STUBS
-static asmlinkage long (*real_sys_execve)(struct pt_regs *regs);
-
-static asmlinkage long fh_sys_execve(struct pt_regs *regs)
-{
-	long ret;
-	char *kernel_filename;
-
-	kernel_filename = duplicate_filename((void*) regs->di);
-
-	pr_info("execve() before: %s\n", kernel_filename);
-
-	kfree(kernel_filename);
-
-	ret = real_sys_execve(regs);
-
-	pr_info("execve() after: %ld\n", ret);
-
-	return ret;
-}
-#else
-static asmlinkage long (*real_sys_execve)(const char __user *filename,
-		const char __user *const __user *argv,
-		const char __user *const __user *envp);
 
 static asmlinkage long fh_sys_execve(const char __user *filename,
-		const char __user *const __user *argv,
-		const char __user *const __user *envp)
+                                     const char __user *const __user *argv,
+                                     const char __user *const __user *envp)
 {
-	long ret;
-	char *kernel_filename;
+    long ret;
+    char *kernel_filename;
 
-	kernel_filename = duplicate_filename(filename);
+    kernel_filename = duplicate_filename(filename);
+    pr_info("execve() before: %s\n", kernel_filename);
+    kfree(kernel_filename);
 
-	pr_info("execve() before: %s\n", kernel_filename);
+    ret = real_sys_execveat(AT_FDCWD, filename, argv, envp, 0);
+    pr_info("execveat() after: %ld\n", ret);
 
-	kfree(kernel_filename);
-
-	ret = real_sys_execve(filename, argv, envp);
-
-	pr_info("execve() after: %ld\n", ret);
-
-	return ret;
+    return ret;
 }
+
+static asmlinkage long fh_sys_execveat(
+    int fd,
+    const char __user *filename,
+    const char __user *const __user *argv,
+    const char __user *const __user *envp,
+    int flags)
+{
+    long ret;
+    char *kernel_filename;
+
+    kernel_filename = duplicate_filename(filename);
+    pr_info("execveat() before: %s\n", kernel_filename);
+    kfree(kernel_filename);
+
+    ret = real_sys_execveat(fd, filename, argv, envp, flags);
+    pr_info("execveat() after: %ld\n", ret);
+
+    return ret;
+}
+
+
 #endif
 
 /*
@@ -356,6 +421,7 @@ static asmlinkage long fh_sys_execve(const char __user *filename,
 static struct ftrace_hook demo_hooks[] = {
 	HOOK("sys_clone",  fh_sys_clone,  &real_sys_clone),
 	HOOK("sys_execve", fh_sys_execve, &real_sys_execve),
+    HOOK("sys_execveat", fh_sys_execveat, &real_sys_execveat),
 };
 
 static int fh_init(void)
