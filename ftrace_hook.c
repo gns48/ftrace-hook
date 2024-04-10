@@ -16,9 +16,10 @@
 #include <linux/version.h>
 #include <linux/kprobes.h>
 #include <linux/namei.h>
+#include <linux/fs_struct.h>
 
-MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
-MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com>");
+MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace with path translation");
+MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com>, gns <gleb.semenov@gmail.com>");
 MODULE_LICENSE("GPL");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
@@ -238,41 +239,129 @@ void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
 #pragma GCC optimize("-fno-optimize-sibling-calls")
 #endif
 
-static char *get_absolute_path(int dfd, int lookup_flags,
-                               const char __user *user_filename,
-                               char *buffer, int buffer_length, int *error)
-{
-    struct path path;
-    char *ret_ptr = NULL;
-    int rv;
-
-    *error = 0;
-    rv = user_path_at(dfd, user_filename, lookup_flags, &path);
-    if (rv)
-        *error = rv;
-    else
-        ret_ptr = d_path(&path, buffer, buffer_length);
-    return ret_ptr;
-}
-
-int check_filename(int dfd, const char __user *filename) {
-    int lookup_flags =
-        LOOKUP_FOLLOW | LOOKUP_EMPTY |
-        LOOKUP_DOWN | LOOKUP_MOUNTPOINT;
+struct translation_blob {
     char *lookup_buffer;
-    char *abspath;
-    int rv = 0;
+    char *kernel_filename;
+    char* abspath;
+    int empty;
+} translation_blob_t;
 
-    lookup_buffer = kmalloc(PATH_MAX, GFP_KERNEL);
-    if(!lookup_buffer) return -ENOMEM;
+int translate_filename(translation_blob_t *tb, int dfd,
+                       const char __user *filename)
+{
+    int rv;
+    int lookup_flags =
+        LOOKUP_FOLLOW | LOOKUP_DOWN | LOOKUP_MOUNTPOINT | LOOKUP_PARENT;
+    struct path path;
 
-    abspath = get_absolute_path(dfd, lookup_flags, filename,
-                                lookup_buffer, PATH_MAX, &rv);
-    if(abspath) {
-        pr_info("%s: abspath: %s\n", __func__, abspath);
+    tb->lookup_buffer = __getname();
+    if(!tb->lookup_buffer) return -ENOMEM;
+
+
+    rv = user_path_at_empty(dfd, filename, lookup_flags, &path, &tb->empty);
+    if (!rv) tb->abspath = d_path(&path, tb->lookup_buffer, PATH_MAX);
+    path_put(&path);
+
+    if (tb->abspath) return 0;
+
+    stncpy_from_user(tb->lookup_buffer, filename, PATH_MAX);
+    if(tb->lookup_buffer[0] == '/') {
+        /* it looks like we have absolute path */
+        tb->abspath = tb->lookup_buffer;
+        return 0;
     }
 
-    kfree(lookup_buffer);
+
+
+
+
+
+
+
+    return rv;
+
+}
+
+
+int check_filename(const char* caller, int dfd, const char __user *filename) {
+    int lookup_flags =
+        LOOKUP_FOLLOW | LOOKUP_DOWN | LOOKUP_MOUNTPOINT | LOOKUP_PARENT;
+    char *lookup_buffer = NULL;
+    char *pwd_buf = NULL;
+    char *kernel_filename = NULL;
+    char *abspath = NULL;
+    struct path path;
+    int empty;
+    int rv = 0;
+
+    lookup_buffer = __getname();
+    if(!lookup_buffer) return -ENOMEM;
+
+    rv = user_path_at_empty(dfd, filename, lookup_flags, &path, &empty);
+    if (!rv) abspath = d_path(&path, lookup_buffer, PATH_MAX);
+    path_put(&path);
+
+    if(abspath)
+        pr_info("%s:%s: abspath: %s\n", caller, __func__, abspath);
+    else {
+        /* relative or non-existent path */
+        kernel_filename = __getname();
+        if(!kernel_filename) {
+            rv = -ENOMEM;
+            goto out;
+        }
+
+        stncpy_from_user(kernel_filename, filename, PATH_MAX);
+        if (kernel_filename[0] == '/') {
+            pr_info("%s:%s: non-existent absolute filename given: %s\n", caller, __func__, kernel_filename);
+        }
+        else if (dfd == AT_FDCWD) {
+            /* relative filename */
+            char *pwd_path;
+            pwd_buf = __getname();
+            if (!pwd_buf) {
+                rv = -ENOMEM;
+                goto out;
+            }
+            get_fs_pwd(current->fs, &path);
+            pwd_path = dentry_path_raw(path.dentry, pwd_buf, PATH_MAX);
+            path_put(&path);
+            strcpy(lookup_buffer, pwd_path);
+            strcat(lookup_buffer, "/");
+            strcat(lookup_buffer, kernel_filename);
+
+        }
+
+
+
+
+      /* try to construct full path */
+      char *pwd_path;
+
+      buf = __getname();
+      if (!buf) {
+        rv = -ENOMEM;
+        goto out;
+        }
+
+        get_fs_pwd(current->fs, &path);
+        pwd_path = dentry_path_raw(path.dentry, buf, PATH_MAX);
+        if ((rv = IS_ERR(pwd_path))) {
+            pr_err("dentry_path_raw failed: %li", PTR_ERR(pwd_path));
+            path_put(&path);
+            goto out;
+        } else {
+
+            pr_info("%s:%s: Full path: %s",  caller, __func__, full_path);
+        }
+        path_put(&path);
+        __putname(buf);
+    }
+out:
+    __putname(lookup_buffer);
+    if (kernel_filename) __putname(kernel_filename);
+    if (pwd_buf) __putname(pwd_buf);
+
     return rv;
 }
 
@@ -281,6 +370,11 @@ int check_filename(int dfd, const char __user *filename) {
 static asmlinkage long (*real_sys_clone)(struct pt_regs *regs);
 static asmlinkage long (*real_sys_execve)(struct pt_regs *regs);
 static asmlinkage long (*real_sys_execveat)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_open)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_openat)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_mkdir)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_mkdirat)(struct pt_regs *regs);
+static asmlinkage long (*real_sys_creat)(struct pt_regs *regs);
 
 static asmlinkage long fh_sys_clone(struct pt_regs *regs) {
 	long ret;
@@ -294,7 +388,7 @@ static asmlinkage long fh_sys_clone(struct pt_regs *regs) {
 static asmlinkage long fh_sys_execve(struct pt_regs *regs) {
     long ret;
 
-    check_filename(AT_FDCWD, (void*)regs->di);
+    check_filename("fh_sys_execve", AT_FDCWD, (void*)regs->di);
 
     ret = real_sys_execve(regs);
     pr_info("execve() after: %ld\n", ret);
@@ -313,10 +407,96 @@ static asmlinkage long fh_sys_execve(struct pt_regs *regs) {
 static asmlinkage long fh_sys_execveat(struct pt_regs *regs) {
     long ret;
 
-    check_filename((int)regs->di, (void*)regs->si);
+    check_filename("fh_sys_execveat", (int)regs->di, (void*)regs->si);
 
     ret = real_sys_execveat(regs);
     pr_info("execveat() after: %ld\n", ret);
+
+    return ret;
+}
+
+/*
+  %rax __NR_open
+  %di  const char *filename
+  %si  int flags
+  %rdx int mode
+*/
+static asmlinkage long fh_sys_open(struct pt_regs *regs) {
+    long ret;
+
+    check_filename("fh_sys_open", AT_FDCWD, (void*)regs->di);
+
+    ret = real_sys_open(regs);
+    pr_info("open() after: %ld\n", ret);
+
+    return ret;
+}
+
+/*
+  %rax __NR_openat
+  %rdi int dfd
+  %rsi const char *filename
+  %rdx int flags
+  %r10 int mode
+*/
+static asmlinkage long fh_sys_openat(struct pt_regs *regs) {
+    long ret;
+
+    check_filename("fh_sys_openat", (int)regs->di, (void*)regs->si);
+
+    ret = real_sys_openat(regs);
+    if (!ret)
+        pr_info("openat() after: %ld\n", ret);
+
+    return ret;
+}
+
+
+/*
+  %rax __NR_mkdir
+  %di const char *pathname
+  %si int mode
+*/
+static asmlinkage long fh_sys_mkdir(struct pt_regs *regs) {
+    long ret;
+
+    check_filename("fh_sys_mkdir", AT_FDCWD, (void*)regs->di);
+
+    ret = real_sys_mkdir(regs);
+    pr_info("mkdir() after: %ld\n", ret);
+
+    return ret;
+}
+
+/*
+  %rax __NR_mkdirat
+  %rdi int dfd
+  %rsi const char *pathname
+  %rdx int mode
+*/
+static asmlinkage long fh_sys_mkdirat(struct pt_regs *regs) {
+    long ret;
+
+    check_filename("fh_sys_mkdirat", (int)regs->di, (void*)regs->si);
+
+    ret = real_sys_mkdirat(regs);
+    pr_info("mkdirat() after: %ld\n", ret);
+
+    return ret;
+}
+
+/*
+  %rax __NR_creat
+  %di const char *pathname
+  %si int mode
+*/
+static asmlinkage long fh_sys_creat(struct pt_regs *regs) {
+    long ret;
+
+    check_filename("fh_sys_creat", AT_FDCWD, (void*)regs->di);
+
+    ret = real_sys_creat(regs);
+    pr_info("creat() after: %ld\n", ret);
 
     return ret;
 }
@@ -331,17 +511,15 @@ static asmlinkage long (*real_sys_clone)(unsigned long clone_flags,
                                          unsigned long tls);
 
 static asmlinkage long (*real_sys_execve)(
-    const char __user *filename,
-    const char __user *const __user *argv,
+    const char __user *filename, const char __user *const __user *argv,
     const char __user *const __user *envp);
 
-
 static asmlinkage long (*real_sys_execveat)(
-    int fd,
-    const char __user *filename,
-    const char __user *const __user *argv,
-    const char __user *const __user *envp,
-    int flags);
+    int fd, const char __user *filename, const char __user *const __user *argv,
+    const char __user *const __user *envp, int flags);
+
+
+
 
 static asmlinkage long fh_sys_clone(unsigned long clone_flags,
                                     unsigned long newsp,
@@ -422,6 +600,11 @@ static struct ftrace_hook demo_hooks[] = {
 	HOOK("sys_clone",  fh_sys_clone,  &real_sys_clone),
 	HOOK("sys_execve", fh_sys_execve, &real_sys_execve),
     HOOK("sys_execveat", fh_sys_execveat, &real_sys_execveat),
+    HOOK("sys_open", fh_sys_open, &real_sys_open),
+    HOOK("sys_openat", fh_sys_openat, &real_sys_openat),
+    HOOK("sys_mkdir", fh_sys_mkdir, &real_sys_mkdir),
+    HOOK("sys_mkdirat", fh_sys_mkdirat, &real_sys_mkdirat),
+    HOOK("sys_creat", fh_sys_creat, &real_sys_creat),
 };
 
 static int fh_init(void)
